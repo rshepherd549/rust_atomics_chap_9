@@ -127,4 +127,14 @@ impl<T> Drop for MutexGuard<'_, T> {
 }
 ```
 
+- `wake_one` is sufficient and `wake_all` would not achieve any more but might waste other processes' time.
+- Another thread creating a `MutexGuard` might still take the lock first
+- Without the `wake_one_` the code would still be safe and correct, but unpredictable.
+- Without the `wait` and `wake` we'd be back to a spin-lock.
+- In general, `wait` and `wake` do not effect the correctness of the memory-safety correctness.
+
+<!--
+Need to prompt re-check on the waiting thread with wake.
+-->
+
 ---
