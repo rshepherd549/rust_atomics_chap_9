@@ -120,7 +120,6 @@ impl<T> Drop for MutexGuard<'_, T> {
   fn drop(&mut self) {
     // Set the state back to 0: unlocked.
     self.mutex.state.store(0, Release);
-
     // Wake up one of the waiting threads, if any.
     wake_one(&self.mutex.state);
   }
@@ -138,3 +137,104 @@ Need to prompt re-check on the waiting thread with wake.
 -->
 
 ---
+
+## Avoiding Syscalls
+
+`wait` and `wake` can be slow calls to the kernels.
+`wait` is only called when needed, but `wake` is always called.
+`wake` is only needed if there are waiters, which we can track with an extra locked state:
+```rust
+impl<T> Mutex<T> {
+  pub const fn new(value: T) -> Self {
+    state: AtomicU32::new(0), //0:unlocked state, 1:no listeners, 2:listeners
+    value UnsafeCell::new(value),
+  }
+}
+```
+
+---
+
+
+```rust
+pub fn lock(&self) -> MutexGuard<T> {
+  if self.state.compare_exchange(0,1,Acquire,Relaxed).ie_err() { //already locked
+    while self.state.swap(2, Acquire) != 0 { //additional lock if still locked
+      wait(&self.state, 2);
+    }
+  }
+  MutexGuard { mutex: self}
+}
+```
+```rust
+impl<T> Drop for MutexGuard<'_, T> {
+  fn drop(&mut self) {
+    if self.mutex.state.swap(0, Release) == 2 { //if other listeners
+      wake_one(&self.mutex.state);
+    }
+}
+```
+In the uncontested case no `wait` or `wake` is used.
+
+---
+
+A common contested case is a parallel thread locking briefly. We can use a short spin lock to wait for such contention
+before resorting to the slower `wait`.
+```rust
+pub fn lock(&self) -> MutexGuard<T> {
+  if self.state.compare_exchange(0,1,Acquire,Relaxed).ie_err() { //already locked
+    lock_contended(&self.state);
+  }
+  MutexGuard { mutex: self}
+}
+fn lock_contended(state: &AtomicU32) {
+  let mut spin_count = 0;
+  while state.load(Relaxed) == 1 && spin_count < 100 {
+    spin_count += 1;
+    std::hint::spin_loop();
+  }
+  if stated.compare_exchange(0,1,Acquire,Relaxed).is_ok() {
+    return;
+  }
+  while state.swap(2,Acquire) != 0 {
+    wait(state,2);
+  }
+}
+```
+
+---
+
+### Further optimization hints
+
+`std::hint::spin_loop();`` //https://doc.rust-lang.org/stable/std/hint/fn.spin_loop.html
+
+Add `#[cold]` to `lock_contended`
+
+Add `#[inline]` to `Mutex.lock` and `MutexGuard.Drop`
+
+---
+
+## Benchmarking
+
+### Uncontended
+
+Platform | 2-state (ms) | 3-state (ms)
+--- | --- | ---
+Linux                 |  400 | 40
+Linux (old processor) | 1800 | 60
+macOS                 |   50 | 50
+
+<!--
+macOS performs own bookkeeping to avoid unnecessary syscalls
+-->
+
+### Contended (4 threads)
+
+Platform | `wait`` (ms) | spin + `wait` (ms)
+--- | --- | ---
+Linux                 | 650 | 800
+Linux (old processor) | 900 | 750
+
+---
+
+# Condition Variable
+
