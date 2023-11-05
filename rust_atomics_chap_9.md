@@ -238,3 +238,353 @@ Linux (old processor) | 900 | 750
 
 # Condition Variable
 
+## What's it for?
+
+Waiting on a condition of mutex protected data
+
+*Threads waiting vector containing elements*.
+
+e.g. the example from chapter 2:
+
+We could do this manually:
+
+---
+
+```rust
+let queue = Mutex::new(VecDeque::new());
+
+thread::scope(|s|) {
+  s.spawn(|| {
+    loop {
+      {
+        let mut q = queue.lock().unwrap(); //blocking Aquire
+        if let Some(item) = q.pop_front() {
+          drop(q);
+          dbg!(item);
+        }
+        //unblocking Release
+      }
+      //'wait' a bit before looking again
+      thread::sleep(Duration::from_secs(1));
+    }
+  });
+  for i in 0.. {
+    queue.lock().unwrap().push_back(i);
+    thread::sleep(Duration::from_secs(1));
+  }
+}
+```
+
+---
+
+Rather than waking regularly and blocking the Mutex while checking the condition,
+it would save time if the thread only re-Acquired the Mutex when code that creates the condition
+signals that it was worth checking.
+
+`Condvar::notify_one()` and `Condvar::notify_all()` send this signal:
+
+---
+
+```rust
+let queue = Mutex::new(VecDeque::new());
+let not_empty = Condvar::new();
+
+thread::scope(|s|) {
+  s.spawn(|| {
+    loop {
+      let mut q = queue.lock().unwrap(); //blocking Aquire
+      let item = loop {
+        if let Some(item) = q.pop_front() {
+          break item;
+        }
+        else { //If no elements then Release, 'wait' until not_empty notification, then Acquire
+          q = not_empty.wait(q).unwrap();
+        }
+      };
+      drop(q);
+      dbg!(item);
+      //Unblocking Release
+    }
+  });
+  for i in 0.. {
+    queue.lock().unwrap().push_back(i); // Acquire,push_back,Release..
+    not_empty.notify_one();             // ..before notifying
+    thread::sleep(Duration::from_secs(1));
+  }
+}
+```
+
+---
+
+A minimal implementation could use a counter:
+
+```rust
+pub struct Condvar {
+  counter: AtomicU32,
+}
+impl Condvar {
+  pub const fn new() -> Self {
+    Self {counter: AtomicU32::new(0)}
+  }
+}
+pub fn notify_one(&self) {
+  self.counter.fetch_add(1, Relaxed);
+  wake_one(&self.counter);
+}
+pub fn notify_all(&self) {
+  self.counter.fetch_add(1, Relaxed);
+  wake_all(&self.counter);
+}
+```
+
+---
+
+```rust
+pub fn wait<'a,T>(&self, guard: MutexGuard<'a,T>) -> MutexGuard<'a,T> {
+  let counter_value = self.counter.load(Relaxed);
+
+  // Unlock the mutex by dropping the guard,
+  // but remember the mutex so we can lock it again later.
+  let mutex = guard.mutex;
+  drop(guard);
+
+  // Wait, but only if the counter hasn't changed since unlocking.
+  wait(&self.counter, counter_value); //acceptable risk of 4,294,967,296 overflow
+
+  mutex.lock();
+}
+```
+
+<!--
+The counter-intuitive aspect for me is that the majority of the thread's code occurs while holding the mutex locked.
+It is released while waiting - which will hopefully be the majority of the time.
+
+Testing requires care, to prove that the condition variable waits or sleeps, not just spins
+-->
+
+---
+
+## Avoiding Syscalls
+
+The `wait` wouldn't be called unless our check had already confirmed that the condition hadn't been met.
+
+We can try avoiding the sys calls in the `wake` using the same count of waiting threads.
+
+```rust
+pub struct Condvar {
+  counter: AtomicU32,
+  num_waiters: AtomicUsize, //New! plenty for possible number of threads
+}
+impl Condvar {
+  pub const fn new() -> Self {
+    Self {
+      counter: AtomicU32::new(0),
+      num_waiters: AtomicUsize::new(0), //New!
+    }
+  }
+}
+```
+
+--- 
+
+Notifications can avoid the `wait` if there are no waiters..
+
+```rust
+pub fn notify_one(&self) {
+  if self.num_waiters.load(Relaxed) > 0 { //New!
+    self.counter.fetch_add(1, Relaxed);
+    wake_one(&self.counter);
+  }
+}
+pub fn notify_all(&self) {
+  if self.num_waiters.load(Relaxed) > 0 { //New!
+    self.counter.fetch_add(1, Relaxed);
+    wake_all(&self.counter);
+  }
+}
+```
+
+---
+
+..and increment it for a waiter, and decrement when woken.
+
+```rust
+pub fn wait<'a,T>(&self, guard: MutexGuard<'a,T>) -> MutexGuard<'a,T> {
+  self.num_waiters.fetch_add(1, Relaxed); //New!
+
+  let counter_value = self.counter.load(Relaxed);
+
+  let mutex = guard.mutex;
+  drop(guard);
+
+  wait(&self.counter, counter_value);
+
+  self.num_waiters.fetch_sum(1, Relaxed); //New!
+
+  mutex.lock();
+}
+```
+
+<!--
+TBD Consider the Relaxed loading throughout - and whether the happens-before relationships are appropriately maintained.
+They so seem to rely on human reasoning, rather than the type/static-style checking we've come to expect from Rust. 
+-->
+
+---
+
+## Avoiding Spurious Wake-ups
+
+---
+
+## Thundering Herd Problem
+
+---
+
+# Reader-Writer Lock
+
+```rust
+pub struct RwLock<T> {
+  state: AtomicU32, // Number of readers, or u32::MAX if write-locked
+  value: UnSafeCell<T>,
+}
+```
+```rust
+unsafe impl<T> Sync for RwLock<T> where T: Send + Sync {}
+```
+
+```rust
+impl<T> RwLock<T> {
+  pub const fn new(value: T) -> Self {
+    Self {
+      state: AtomicU32::new(0), //Unlocked
+      value: UnsafeCell::new(value),
+    }
+  }
+  pub fn read(&self) -> ReadGuard<T> {
+    ...
+  }
+  pub fn write(&self) -> WriteGuard<T> {
+    ...
+  }
+  pub struct ReadGuard<'a,T> {
+    rwlock: &'a RwLock<T>,
+  }
+  pub struct WriteGuard<'a,T> {
+    rwlock: &'a RwLock<T>,
+  }
+}
+```
+
+```rust
+impl<T> Deref for WriteGuard<'_,T> {
+  type Target = T;
+  fn deref(&self) -> &T {
+    unsafe { &*self.rwlock.value.get()}
+  }
+}
+impl<T> DerefMut for WriteGuard<'_,T> {
+  type Target = T;
+  fn deref_mut(&self) -> &T {
+    unsafe { &*self.rwlock.value.get()}
+  }
+}
+```
+
+```rust
+impl<T> Deref for ReadGuard<'_,T> {
+  type Target = T;
+  fn deref(&self) -> &T {
+    unsafe { &*self.rwlock.value.get()}
+  }
+}
+```
+
+```rust
+pub fn read(&self) -> ReadGuard<T> {
+  let mut s = self.state.load(Relaxed);
+  loop {
+    if s < u32::MAX {
+      assert!(s != u32::MAX-1, "too many readers");
+      match self.state.compare_exchange_weak(
+        s, s+1, Acquire, Relaxed
+      ) {
+        Ok(_) => return ReadGuard { rwlock: self },
+        Err(e) => s = e,
+      }
+    }
+    if s == u32::MAX {
+      wait(&self.state, u32::MAX);
+      s = self.state.load(Relaxed);
+    }
+  }
+}
+```
+
+```rust
+pub fn write(&self) -> WriteGuard<T> {
+  while let Err(s) = self.state.compare_exchange(
+    0, u32::MAX, Acquire, Relaxed
+  ) {
+    wait(&self.state, s); //Wait while already locked
+  }
+  WriteGuard { rwlock: self }
+}
+```
+
+```rust
+impl<T> Drop for ReadGuard<'_,T> {
+  fn drop(&mut self) {
+    if self.rwlock.state.fetch_sub(1,Release) == 1 {
+      //Wake up a waiting writer, if any.
+      wake_one(&self.rwlock.state);
+    }
+  }
+}
+```
+```rust
+impl<T> Drop for WriteGuard<'_,T> {
+  fn drop(&mut self) {
+    self.rwlock.state.store(0,Release) == 1 {
+    //Wake up all waiting readers and writers.
+    wake_all(&self.rwlock.state);
+  }
+}
+```
+
+---
+
+## Avoiding Busy-Looping Writers
+
+```rust
+pub struct RwLock<T> {
+  state: AtomicU32, // The number of readers, or u32::MAX if write-locked
+  writer_wake_counterL AtomicU32, //New! Incremented to wake up writers
+  value: UnsafeCell<T>,
+}
+impl<T> RwLock<T> {
+  pub const fn new(value: T) -> Self {
+    Self {
+      state: AtomicU32::new(0),
+      writer_wake_counter: AtomicU32::new(0), //New!
+      value: UnsafeCell::new(value),
+    }
+  }
+}
+```
+
+```rust
+pub fn write(&self) -> WriteGuard<T> {
+  while self.state.compare_exchange(
+    0, u32::MAX, Acquire, Relaxed
+  ).is_err() {
+    let w = self.writer_wake_coutner.load(Acquire);
+    if self.state.load(Relaxed) != 0 {
+      // Wait if the RwLock is still locked, but only if
+      // there have been no wake signals since we checked.
+      wait(&self.writer_wake_counter, w);
+    }
+  }
+  WriteGuard { rwlock: self }
+}
+```
+
