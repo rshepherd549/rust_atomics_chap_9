@@ -355,12 +355,14 @@ pub fn wait<'a,T>(&self, guard: MutexGuard<'a,T>) -> MutexGuard<'a,T> {
 }
 ```
 
-<!--
-The counter-intuitive aspect for me is that the majority of the thread's code occurs while holding the mutex locked.
-It is released while waiting - which will hopefully be the majority of the time.
+---
+
+*The counter-intuitive aspect for me is that the majority of the thread's code occurs while holding the mutex locked.
+It is released while waiting - which will hopefully be the majority of the time.*
+
+*There appear to be analogies with coroutines.*
 
 Testing requires care, to prove that the condition variable waits or sleeps, not just spins
--->
 
 ---
 
@@ -387,7 +389,7 @@ impl Condvar {
 
 --- 
 
-Notifications can avoid the `wait` if there are no waiters..
+Notifications can avoid the `wake` if there are no waiters..
 
 ```rust
 pub fn notify_one(&self) {
@@ -406,7 +408,7 @@ pub fn notify_all(&self) {
 
 ---
 
-..and increment it for a waiter, and decrement when woken.
+..and waiters increment it, and decrement when woken.
 
 ```rust
 pub fn wait<'a,T>(&self, guard: MutexGuard<'a,T>) -> MutexGuard<'a,T> {
@@ -424,19 +426,54 @@ pub fn wait<'a,T>(&self, guard: MutexGuard<'a,T>) -> MutexGuard<'a,T> {
   mutex.lock();
 }
 ```
+---
 
-<!--
-TBD Consider the Relaxed loading throughout - and whether the happens-before relationships are appropriately maintained.
-They so seem to rely on human reasoning, rather than the type/static-style checking we've come to expect from Rust. 
--->
+Consider the Relaxed loading throughout - and whether the happens-before relationships are appropriately maintained.
+They rely on human reasoning, but do make the expectations explicit and documentation of reasoning is encouraged. 
+
+For instance: the potential problem of `num_waiters.load(Relaxed)` occurring before the `num_waiters.fetch_add(1, Relaxed)`.
+
+(Note that this was not a concern before we added the optimization book-keeping.)
+
+But analysis shows that this cannot happen because the `add` happens before the mutex is unlocked
 
 ---
 
 ## Avoiding Spurious Wake-ups
 
+An example of a potential spurious wake-up can be seen in
+
+```rust
+pub fn notify_one(&self) {
+  if self.num_waiters.load(Relaxed) > 0 { //New!
+    self.counter.fetch_add(1, Relaxed);
+    wake_one(&self.counter);
+  }
+}
+```
+A waiting thread might spot the `counter` value changed and then another thread be woken by the `wake_one`.
+
+---
+
+This can happen more often than random chance would suggest because the act of mutex locking/unlocking tends to synchronize the notifier and waiter(s).
+
+A solution is to add another counter, which the `notify` would increment and the waiter would decrement. A thread wakened by the `wake_one` would see the value zero and not lock/unlock the mutex and just back to sleep.
+
+But this extra book-keeping opens the door to more subtle problems, which might cause some threads to never make progress. Whether this is acceptable depends on your situation.
+
+GNU's libc library avoids the problem by categorizing groups of waiters but requires more storage and a more complex algorithm.
+
 ---
 
 ## Thundering Herd Problem
+
+`notify_all` exposes the *thundering-herd* problem: multiple threads will all wake at once, all try to grab the same mutex, blocking each other in series, waiting their turn.
+
+`notify_all` is perhaps an anti-pattern.
+
+If necessary then it can be optimized for if the OS supports *requeuing* so that all but the first, successful, thread are requeued to `wait` on the mutex rather than the condition variable, which doesn't wake it up.
+
+This requires more complexity as the `CondVar` will need to keep a pointer to the `Mutex` to know what to wait on.
 
 ---
 
