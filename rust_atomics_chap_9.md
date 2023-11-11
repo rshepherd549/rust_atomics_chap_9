@@ -4,6 +4,9 @@
 
 ### Richard Shepherd
 
+- rshepherd@esri.com
+- https://github.com/rshepherd549
+
 ---
 
 This chapter builds a mutex, condition variable and reader-writer lock, without busy looping
@@ -612,10 +615,14 @@ impl<T> Drop for WriteGuard<'_,T> {
 
 ## Avoiding Busy-Looping Writers
 
+A lot of readers might cause the writer to waste resources, especially if the writer's `wait` is a comparatively slow sys call and keeps being triggered for every change in readers.
+
+A possible solution is for writers to wait specifically for the last reader:
+
 ```rust
 pub struct RwLock<T> {
   state: AtomicU32, // The number of readers, or u32::MAX if write-locked
-  writer_wake_counterL AtomicU32, //New! Incremented to wake up writers
+  writer_wake_counter: AtomicU32, //New! Incremented to wake up writers
   value: UnsafeCell<T>,
 }
 impl<T> RwLock<T> {
@@ -628,16 +635,19 @@ impl<T> RwLock<T> {
   }
 }
 ```
+---
+
+The writer now waits until the last reader relinquishes its lock:
 
 ```rust
 pub fn write(&self) -> WriteGuard<T> {
   while self.state.compare_exchange(
     0, u32::MAX, Acquire, Relaxed
   ).is_err() {
-    let w = self.writer_wake_coutner.load(Acquire);
+    let w = self.writer_wake_counter.load(Acquire);
     if self.state.load(Relaxed) != 0 {
       // Wait if the RwLock is still locked, but only if
-      // there have been no wake signals since we checked.
+      // there have been no wake signals since we last checked
       wait(&self.writer_wake_counter, w);
     }
   }
@@ -645,30 +655,38 @@ pub fn write(&self) -> WriteGuard<T> {
 }
 ```
 
+---
+
+So the `Drop`s have to signalling writers and readers separately:
 ```rust
 impl<T> Drop for ReadGuard<'_,T> {
   fn drop(&mut self) {
     if self.rwlock.state.fetch_sub(1,Release) == 1 {
-      self.rwlock.writer_wake.fetch_add(1,Release); //New!
-      wake_one(&self.rwlock.writer_wake_counter); //Changed!
+      self.rwlock.writer_wake.fetch_add(1,Release); //New! It's worth a writer waking
+      wake_one(&self.rwlock.writer_wake_counter); //Changed! Wake a writer
+      //Readers still don't need waking
     }
   }
 }
-```
-```rust
 impl<T> Drop for WriteGuard<'_,T> {
   fn drop(&mut self) {
     self.rwlock.state.store(0,Release);
-    self.rwlock.writer_wake_counter.fetch_add(1,Release); //New!
-    wake_one(&self.rwlock.writer_wake_counter); //New!
-    wake_all(&self.rwlock.state);
+    self.rwlock.writer_wake_counter.fetch_add(1,Release); //New! It's worth a writer waking
+    wake_one(&self.rwlock.writer_wake_counter); //New! Wake a writer (given priority)
+    wake_all(&self.rwlock.state); //Wake readers
   }
 }
 ```
+
+<!-- If `wake_one` returned a number of threads woken then we could avoid calling `wake_all` -->
 
 ---
 
 ## Avoiding Writer Starvation
+
+A related problem is lots of readers stopping a writer getting a chance.
+
+One solution would be to block new readers if a writer is waiting:
 
 ```rust
 pub struct RwLock<T> {
@@ -683,11 +701,16 @@ pub struct RwLock<T> {
   value: UnsafeCell<T>,
 }
 ```
+*Note the bit packing of data allows us to share one atomic variable.*
+
+---
+
+
 ```rust
 pub fn read(&self) -> ReadGuard<T> {
   let mut s = self.state.load(Relaxed);
   loop {
-    if s% 2 == 0 { // Even.
+    if s % 2 == 0 { // Even (which doesn't include MAX (4,294,967,295)).
       assert!(s != u32::MAX - 2, "too many readers");
       match self.state.compare_exchange_weak(
         s, s+2, Acquire, Relaxed
@@ -697,12 +720,18 @@ pub fn read(&self) -> ReadGuard<T> {
       }
     }
     if s % 2 == 1 { //Odd
-      wait(&self.state,2);
+      wait(&self.state, s);
       s = self.state.load(Relaxed);
     }
   }
 }
 ```
+
+---
+
+If state is `0` or `1` then a writer can try to take the lock:
+
+
 ```rust
 pub fn write(&self) -> WriteGuard<T> {
   let mut s = self.state.load(Relaxed);
@@ -716,7 +745,7 @@ pub fn write(&self) -> WriteGuard<T> {
         Err(e) => { s = e; continue; }
       }
     }
-    // Block new readers, by making suret he state is odd.
+    // Block new readers, by making sure the state is odd.
     if s % 2 == 0 {
       match self.state.compare_exchange(
         s, s+1, Relaxed, Relaxed
@@ -727,29 +756,38 @@ pub fn write(&self) -> WriteGuard<T> {
     }
     // Wait, if it's still locked
     let w = self.writer_wake_counter.load(Acquire);
-    s = self.state.load(Relaxed);
+    s = self.state.load(Relaxed); //Update s for next iteration
     if s >= 2 {
       wait(&self.writer_wake_counter, w);
-      s = self.state.load(Relaxed);
+      s = self.state.load(Relaxed); //Update s for next iteration
     }
   }
 }
 ```
 
+---
+
+`ReadGuard::Drop` can be optimized to only wake a writer when there is definitely one waiting:
+
 ```rust
 impl<T> Drop for ReadGuard<'_,T> {
   fn drop(&mut self) {
     // Decrement the state by 2 to remove one read-lock.
-    if self.rwlock.state.fetch_sub(2,Release) == 3 {
+    if self.rwlock.state.fetch_sub(2, Release) == 3 {
       // If we decremented from 3 to 1, that means
       // the RwLock is now unlocked _and_ there is
       // a waiting writer, which we wake up.
-      self.rwlock.writer_wake_counter.fetch_add(1,Release);
+      self.rwlock.writer_wake_counter.fetch_add(1, Release);
       wake_one(&self.rwlock.writer_wake_counter);
     }
   }
 }
 ```
+
+---
+
+Creating a `WriterGuard` jumps the `state` to `MAX`, so we no longer have any information about writers waiting, so drop just has to continue to signal everyone:
+
 ```rust
 impl<T> Drop for WriteGuard<'_,T> {
   fn drop(&mut self) {
@@ -760,3 +798,13 @@ impl<T> Drop for WriteGuard<'_,T> {
   }
 }
 ```
+
+---
+
+# My take-aways
+
+- Mentally think of `wait` as a spin-lock to remind myself of the what the logic is doing.
+- The optimizations should affect the correctness. Without the optimization logic, the logic should still work, just with wasted resources.
+- Testing needs to at least check that any implementation isn't a spin-lock.
+- Each optimization requiring more state adds more opportunities for a memory-ordering bug and requires more consideration of memory ordering.
+
