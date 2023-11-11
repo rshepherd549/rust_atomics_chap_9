@@ -45,7 +45,7 @@ pub struct Mutex<T> {
   value: UnsafeCell<T>,
 }
 ```
-Promise that the `Mutex` is safe to share between threads:
+Promise that the `Mutex` is safe to share between threads if the type supports `Send`:
 ```rust
 unsafe impl<T> Sync for Mutex<T> where T: Send {}
 ```
@@ -479,15 +479,26 @@ This requires more complexity as the `CondVar` will need to keep a pointer to th
 
 # Reader-Writer Lock
 
+A lock that parallels Rust's own sharing policies: multiple readers or one writer.
+
 ```rust
 pub struct RwLock<T> {
   state: AtomicU32, // Number of readers, or u32::MAX if write-locked
   value: UnSafeCell<T>,
 }
 ```
+
+Promise that the `RwLock` is safe to share between threads if the type supports `Send` & `Sync`, because we want multiple readers to access the data simultaneously:
+
+<!-- unlike Mutex where only one would read at a time -->
+
 ```rust
 unsafe impl<T> Sync for RwLock<T> where T: Send + Sync {}
 ```
+
+---
+
+We need two separate guards and create functions:
 
 ```rust
 impl<T> RwLock<T> {
@@ -512,6 +523,10 @@ impl<T> RwLock<T> {
 }
 ```
 
+---
+
+The write guard needs `Deref` and `DerefMut` (like a `&mut T`), while the read only needs `Deref` (like `&T`) to access the contents:
+
 ```rust
 impl<T> Deref for WriteGuard<'_,T> {
   type Target = T;
@@ -525,9 +540,6 @@ impl<T> DerefMut for WriteGuard<'_,T> {
     unsafe { &*self.rwlock.value.get()}
   }
 }
-```
-
-```rust
 impl<T> Deref for ReadGuard<'_,T> {
   type Target = T;
   fn deref(&self) -> &T {
@@ -536,6 +548,8 @@ impl<T> Deref for ReadGuard<'_,T> {
 }
 ```
 
+---
+
 ```rust
 pub fn read(&self) -> ReadGuard<T> {
   let mut s = self.state.load(Relaxed);
@@ -543,10 +557,10 @@ pub fn read(&self) -> ReadGuard<T> {
     if s < u32::MAX {
       assert!(s != u32::MAX-1, "too many readers");
       match self.state.compare_exchange_weak(
-        s, s+1, Acquire, Relaxed
+        s, s+1, Acquire, Relaxed //Attempt to increase read-locks
       ) {
         Ok(_) => return ReadGuard { rwlock: self },
-        Err(e) => s = e,
+        Err(e) => s = e, //May discover that it has become write-locked
       }
     }
     if s == u32::MAX {
@@ -557,33 +571,39 @@ pub fn read(&self) -> ReadGuard<T> {
 }
 ```
 
+<!-- Instead of `assert` we could make it wait on a change to `s` from `MAX-1`-->
+
+---
+
+Write locking is simpler:
+
 ```rust
 pub fn write(&self) -> WriteGuard<T> {
-  while let Err(s) = self.state.compare_exchange(
-    0, u32::MAX, Acquire, Relaxed
+  while let Err(s) = self.state.compare_exchange( //Keep the current value to wait on
+    0, u32::MAX, Acquire, Relaxed //If no existing locks, set to write-lock
   ) {
-    wait(&self.state, s); //Wait while already locked
+    wait(&self.state, s); //Wait while already locked, until number changes
   }
   WriteGuard { rwlock: self }
 }
 ```
 
+---
+
+Dropping read-locks requires decrementing the number of readers and the last one has the responsibility of informing waiting writers.
+
 ```rust
 impl<T> Drop for ReadGuard<'_,T> {
   fn drop(&mut self) {
-    if self.rwlock.state.fetch_sub(1,Release) == 1 {
-      //Wake up a waiting writer, if any.
-      wake_one(&self.rwlock.state);
+    if self.rwlock.state.fetch_sub(1,Release) == 1 { //fetch_sub returns prev value
+      wake_one(&self.rwlock.state); //Wake up a waiting writer, if any.
     }
   }
 }
-```
-```rust
 impl<T> Drop for WriteGuard<'_,T> {
   fn drop(&mut self) {
     self.rwlock.state.store(0,Release);
-    //Wake up all waiting readers and writers.
-    wake_all(&self.rwlock.state);
+    wake_all(&self.rwlock.state); //Wake up all waiting readers and writers.
   }
 }
 ```
