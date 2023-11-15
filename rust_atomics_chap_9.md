@@ -131,7 +131,6 @@ impl<T> Drop for MutexGuard<'_, T> {
 
 - `wake_one` is sufficient and `wake_all` would not achieve any more but might waste other processes' time.
 - Another thread creating a `MutexGuard` might still take the lock first
-- Without the `wake_one_` the code would still be safe and correct, but unpredictable.
 - Without the `wait` and `wake` we'd be back to a spin-lock.
 - In general, `wait` and `wake` do not effect the correctness of the memory-safety correctness.
 
@@ -143,7 +142,7 @@ Need to prompt re-check on the waiting thread with wake.
 
 ## Avoiding Syscalls
 
-`wait` and `wake` can be slow calls to the kernels.
+`wait` and `wake` can be slow calls to the kernel.
 `wait` is only called when needed, but `wake` is always called.
 `wake` is only needed if there are waiters, which we can track with an extra locked state:
 ```rust
@@ -160,7 +159,7 @@ impl<T> Mutex<T> {
 
 ```rust
 pub fn lock(&self) -> MutexGuard<T> {
-  if self.state.compare_exchange(0,1,Acquire,Relaxed).ie_err() { //already locked
+  if self.state.compare_exchange(0,1,Acquire,Relaxed).is_err() { //already locked
     while self.state.swap(2, Acquire) != 0 { //additional lock if still locked
       wait(&self.state, 2);
     }
@@ -180,11 +179,16 @@ In the uncontested case no `wait` or `wake` is used.
 
 ---
 
-A common contested case is a parallel thread locking briefly. We can use a short spin lock to wait for such contention
-before resorting to the slower `wait`.
+A common contested case is a parallel thread locking briefly.
+We can use a short spin lock to wait for such contention before resorting to the slower `wait`.
+
+<!--
+..but don't want to just spin on the compare_exchange operation because it blocks the cache line
+-->
+
 ```rust
 pub fn lock(&self) -> MutexGuard<T> {
-  if self.state.compare_exchange(0,1,Acquire,Relaxed).ie_err() { //already locked
+  if self.state.compare_exchange(0,1,Acquire,Relaxed).is_err() { //already locked
     lock_contended(&self.state);
   }
   MutexGuard { mutex: self}
@@ -203,6 +207,10 @@ fn lock_contended(state: &AtomicU32) {
   }
 }
 ```
+
+<!-- logic designed for wait until not equal to a specific value -->
+<!-- cold = uncommon case -->
+<!-- inline: unpredictable effect. usually helps for small code -->
 
 ---
 
@@ -245,9 +253,9 @@ Linux (old processor) | 900 | 750
 
 Waiting on a condition of mutex protected data
 
-*Threads waiting vector containing elements*.
-
 e.g. the example from chapter 2:
+
+*Threads waiting vector containing elements*.
 
 We could do this manually:
 
@@ -281,8 +289,7 @@ thread::scope(|s|) {
 ---
 
 Rather than waking regularly and blocking the Mutex while checking the condition,
-it would save time if the thread only re-Acquired the Mutex when code that creates the condition
-signals that it was worth checking.
+it would save time if the thread only re-Acquired the Mutex when code that creates the condition signals that it was worth checking.
 
 `Condvar::notify_one()` and `Condvar::notify_all()` send this signal:
 
@@ -662,7 +669,7 @@ So the `Drop`s have to signalling writers and readers separately:
 impl<T> Drop for ReadGuard<'_,T> {
   fn drop(&mut self) {
     if self.rwlock.state.fetch_sub(1,Release) == 1 {
-      self.rwlock.writer_wake.fetch_add(1,Release); //New! It's worth a writer waking
+      self.rwlock.writer_wake_counter.fetch_add(1,Release); //New! It's worth a writer waking
       wake_one(&self.rwlock.writer_wake_counter); //Changed! Wake a writer
       //Readers still don't need waking
     }
@@ -804,7 +811,7 @@ impl<T> Drop for WriteGuard<'_,T> {
 # My take-aways
 
 - Mentally think of `wait` as a spin-lock to remind myself of the what the logic is doing.
-- The optimizations should affect the correctness. Without the optimization logic, the logic should still work, just with wasted resources.
+- The optimizations, including `wait` & `wake`, should *not* affect the correctness. Without the optimization logic, the logic should still work, just with wasted resources.
 - Testing needs to at least check that any implementation isn't a spin-lock.
 - Each optimization requiring more state adds more opportunities for a memory-ordering bug and requires more consideration of memory ordering.
 
